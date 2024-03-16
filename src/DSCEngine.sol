@@ -20,12 +20,17 @@ contract DSCEngine is ReentrancyGuard {
     error DSCEngine__TokenAddressesMustBeSameLengthThanPriceFeedAddresses();
     error DSCEngine__NotAllowedToken();
     error DSCEngine__DepositCollateralFailed();
+    error DSCEngine__BreaksHealthFactor(uint256 userHealthFactor);
+    error DSCEngine__MintDSCFailed();
 
     /////////////////////
     // State variables //
     /////////////////////
     uint256 private constant ADDITIONAL_FEED_PRECISION = 1e10;
     uint256 private constant PRECISION = 1e18;
+    uint256 private constant LIQUIDATION_TRESHOLD = 50;
+    uint256 private constant LIQUIDATION_PRECISION = 100;
+    uint256 private constant MIN_HEALTH_FACTOR = 1;
 
     mapping(address tokenAddress => address priceFeedAddress) private s_tokenAddressToPriceFeedAddress;
     mapping(address user => mapping(address token => uint256 amount)) private s_collateralDeposited;
@@ -108,6 +113,11 @@ contract DSCEngine is ReentrancyGuard {
      */
     function mintDSC(uint256 _amountOfDSCToMint) external moreThenZero(_amountOfDSCToMint) nonReentrant {
         s_userToAmounOfDSCMinted[msg.sender] += _amountOfDSCToMint;
+        _revertIfHealthFactorIsBroken(msg.sender);
+        (bool success) = i_dscContractAddress.mint(msg.sender, _amountOfDSCToMint);
+        if (!success) {
+            revert DSCEngine__MintDSCFailed();
+        }
     }
 
     function burnDSC() external {}
@@ -128,9 +138,18 @@ contract DSCEngine is ReentrancyGuard {
         collateralValueInUsd = getAccountCollateralValue(_user);
     }
 
-    function _healthFactor(address user) private view returns (uint256) {}
+    function _healthFactor(address _user) private view returns (uint256) {
+        (uint256 totalDSCMinted, uint256 collateralValueInUsd) = _getAccountInformation(_user);
+        uint256 collateralAdjustedForTreshold = (collateralValueInUsd * LIQUIDATION_TRESHOLD) / LIQUIDATION_PRECISION;
+        return (collateralAdjustedForTreshold * PRECISION) / totalDSCMinted;
+    }
 
-    function _revertIfHealthFactorIsBroken(address _user) internal view {}
+    function _revertIfHealthFactorIsBroken(address _user) internal view {
+        uint256 userHealthFactor = _healthFactor(_user);
+        if (userHealthFactor < MIN_HEALTH_FACTOR) {
+            revert DSCEngine__BreaksHealthFactor(userHealthFactor);
+        }
+    }
 
     //////////////////////
     // Functions Public //
@@ -142,6 +161,7 @@ contract DSCEngine is ReentrancyGuard {
             uint256 tokenAmount = s_collateralDeposited[_user][tokenAddress];
             totalCollateralValueInUsd += getUSDValue(tokenAddress, tokenAmount);
         }
+        return totalCollateralValueInUsd;
     }
 
     function getUSDValue(address _tokenAddress, uint256 _tokenAmount) public view returns (uint256) {
@@ -149,5 +169,24 @@ contract DSCEngine is ReentrancyGuard {
         (, int256 price,,,) = priceFeed.latestRoundData();
         // we have to make sure that the decimal places from the price feed are correct. In our case ETH and BTC have the same decimals, but other chains might not.
         return ((uint256(price) * ADDITIONAL_FEED_PRECISION) * _tokenAmount) / PRECISION;
+    }
+
+    //////////////////////
+    // Getter Functions //
+    //////////////////////
+    function getTokenAddressToPriceFeedAddress(address _tokenAddress) public view returns (address) {
+        return s_tokenAddressToPriceFeedAddress[_tokenAddress];
+    }
+
+    function getCollateralTokenAddress(uint256 _index) public view returns (address) {
+        return s_collateralTokenAddresses[_index];
+    }
+
+    function getCollateralTokenAddressesLenght() public view returns (uint256) {
+        return s_collateralTokenAddresses.length;
+    }
+
+    function getDSCCoinAddress() public view returns (DecentralizedStableCoin) {
+        return i_dscContractAddress;
     }
 }
