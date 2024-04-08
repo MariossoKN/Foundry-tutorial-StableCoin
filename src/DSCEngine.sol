@@ -189,4 +189,8 @@ contract DSCEngine is ReentrancyGuard {
     function getDSCCoinAddress() public view returns (DecentralizedStableCoin) {
         return i_dscContractAddress;
     }
+
+    function getCollateralDeposited(address _user, address _tokenAddress) public view returns (uint256) {
+        return s_collateralDeposited[_user][_tokenAddress];
+    }
 }
