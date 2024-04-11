@@ -22,6 +22,9 @@ contract DSCEngine is ReentrancyGuard {
     error DSCEngine__DepositCollateralFailed();
     error DSCEngine__BreaksHealthFactor(uint256 userHealthFactor);
     error DSCEngine__MintDSCFailed();
+    error DSCEngine__RedeemCollateralFailed();
+    error DSCEngine__BurnDSCFailed();
+    error DSCEngine__BreaksHealthFactorOK(uint256 userHealthFactor);
 
     /////////////////////
     // State variables //
@@ -30,7 +33,8 @@ contract DSCEngine is ReentrancyGuard {
     uint256 private constant PRECISION = 1e18;
     uint256 private constant LIQUIDATION_TRESHOLD = 50;
     uint256 private constant LIQUIDATION_PRECISION = 100;
-    uint256 private constant MIN_HEALTH_FACTOR = 1;
+    uint256 private constant MIN_HEALTH_FACTOR = 1e18;
+    uint256 private constant LIQUIDATION_BONUS = 10; // 10%
 
     mapping(address tokenAddress => address priceFeedAddress) private s_tokenAddressToPriceFeedAddress;
     mapping(address user => mapping(address token => uint256 amount)) private s_collateralDeposited;
@@ -43,6 +47,7 @@ contract DSCEngine is ReentrancyGuard {
     // Events //
     ////////////
     event CollateralDeposited(address indexed user, address indexed token, uint256 indexed amount);
+    event CollateralRedeemed(address indexed from, address indexed to, address indexed token, uint256 amount);
 
     ///////////////
     // Modifiers //
@@ -82,7 +87,14 @@ contract DSCEngine is ReentrancyGuard {
     ////////////////////////
     // Functions External //
     ////////////////////////
-    function depositCollateralAndMintDSC() external {}
+    function depositCollateralAndMintDSC(
+        address _tokenCollateralAddress,
+        uint256 _amountCollateral,
+        uint256 _amountOfDSCToMint
+    ) external {
+        depositCollateral(_tokenCollateralAddress, _amountCollateral);
+        mintDSC(_amountOfDSCToMint);
+    }
 
     /**
      *
@@ -90,7 +102,7 @@ contract DSCEngine is ReentrancyGuard {
      * @param _amountCollateral The amount of the deposited collateral
      */
     function depositCollateral(address _tokenCollateralAddress, uint256 _amountCollateral)
-        external
+        public
         moreThenZero(_amountCollateral)
         isAllowedToken(_tokenCollateralAddress)
         nonReentrant
@@ -103,15 +115,30 @@ contract DSCEngine is ReentrancyGuard {
         }
     }
 
-    function redeemCollateralForDSC() external {}
+    function redeemCollateralForDSC(
+        address _tokenCollateralAddress,
+        uint256 _amountCollateral,
+        uint256 _amountOfDSCToBurn
+    ) external {
+        burnDSC(_amountOfDSCToBurn);
+        redeemCollateral(_tokenCollateralAddress, _amountCollateral);
+        // redeemCollateral already check if the healFactor is broken so we dont have to check here
+    }
 
-    function redeemCollateral() external {}
+    function redeemCollateral(address _tokenCollateralAddress, uint256 _amountCollateral)
+        public
+        moreThenZero(_amountCollateral)
+        nonReentrant
+    {
+        _redeemCollateral(_tokenCollateralAddress, _amountCollateral, msg.sender, msg.sender);
+        _revertIfHealthFactorIsBroken(msg.sender);
+    }
 
     /**
      *
      * @param _amountOfDSCToMint The amount of DSC to mint
      */
-    function mintDSC(uint256 _amountOfDSCToMint) external moreThenZero(_amountOfDSCToMint) nonReentrant {
+    function mintDSC(uint256 _amountOfDSCToMint) public moreThenZero(_amountOfDSCToMint) nonReentrant {
         s_userToAmounOfDSCMinted[msg.sender] += _amountOfDSCToMint;
         _revertIfHealthFactorIsBroken(msg.sender);
         (bool success) = i_dscContractAddress.mint(msg.sender, _amountOfDSCToMint);
@@ -120,15 +147,50 @@ contract DSCEngine is ReentrancyGuard {
         }
     }
 
-    function burnDSC() external {}
+    function burnDSC(uint256 _amount) public moreThenZero(_amount) {
+        s_userToAmounOfDSCMinted[msg.sender] -= _amount;
+        // first we transfer the tokens to our contract
+        (bool success) = i_dscContractAddress.transferFrom(msg.sender, address(this), _amount);
+        if (!success) {
+            revert DSCEngine__BurnDSCFailed();
+        }
+        // then we burn them
+        i_dscContractAddress.burn(_amount);
+        _revertIfHealthFactorIsBroken(msg.sender);
+    }
 
-    function liquidate() external {}
+    function liquidate(address _tokenCollateralAddress, address _user, uint256 _debtToCover)
+        external
+        moreThenZero(_debtToCover)
+        nonReentrant
+    {
+        uint256 startingUserHealthFactor = _healthFactor(_user);
+        if (startingUserHealthFactor < MIN_HEALTH_FACTOR) {
+            revert DSCEngine__BreaksHealthFactorOK(startingUserHealthFactor);
+        }
+        uint256 tokenAmountFromDebtCovered = getTokenAmountFromUsd(_tokenCollateralAddress, _debtToCover);
+        uint256 bonusCollateral = (tokenAmountFromDebtCovered * LIQUIDATION_BONUS) / LIQUIDATION_PRECISION;
+        uint256 totalCollateralRedeemed = tokenAmountFromDebtCovered + bonusCollateral;
+        _redeemCollateral(_tokenCollateralAddress, totalCollateralRedeemed, _user, msg.sender);
+    }
 
     function getHealthFactor() external view returns (uint256) {}
 
     //////////////////////////////////
     // Functions Internal & Private //
     //////////////////////////////////
+    function _redeemCollateral(address _tokenCollateralAddress, uint256 _amountCollateral, address _from, address _to)
+        private
+    {
+        s_collateralDeposited[_from][_tokenCollateralAddress] -= _amountCollateral;
+        emit CollateralRedeemed(_from, _to, _tokenCollateralAddress, _amountCollateral);
+
+        bool success = IERC20(_tokenCollateralAddress).transfer(_to, _amountCollateral);
+        if (!success) {
+            revert DSCEngine__RedeemCollateralFailed();
+        }
+    }
+
     function _getAccountInformation(address _user)
         private
         view
@@ -169,6 +231,12 @@ contract DSCEngine is ReentrancyGuard {
         (, int256 price,,,) = priceFeed.latestRoundData();
         // we have to make sure that the decimal places from the price feed are correct. In our case ETH and BTC have the same decimals, but other chains might not.
         return ((uint256(price) * ADDITIONAL_FEED_PRECISION) * _tokenAmount) / PRECISION;
+    }
+
+    function getTokenAmountFromUsd(address _tokenAddress, uint256 _usdAmountInWei) public view returns (uint256) {
+        AggregatorV3Interface priceFeed = AggregatorV3Interface(s_tokenAddressToPriceFeedAddress[_tokenAddress]);
+        (, int256 price,,,) = priceFeed.latestRoundData();
+        return _usdAmountInWei * PRECISION / (uint256(price) * ADDITIONAL_FEED_PRECISION);
     }
 
     //////////////////////
